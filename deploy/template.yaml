@@ -1,0 +1,53 @@
+---
+parameters:
+- name: IMAGE
+  value: quay.io/carbonin/config-image-server
+- name: TAG
+  value: latest
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: assisted-installer
+objects:
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: config-image-server
+    labels:
+      name: config-image-server
+  spec:
+    ports:
+    - port: 8080
+      protocol: TCP
+      name: config-server
+    selector:
+      name: config-image-server
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: config-image-server
+  spec:
+    selector:
+      matchLabels:
+        name: config-image-server
+    template:
+      metadata:
+        labels:
+          name: config-image-server
+      spec:
+        containers:
+        - name: config-image-server
+          image: ${IMAGE}:${TAG}
+          imagePullPolicy: Always
+          ports:
+          - name: config-server
+            containerPort: 8080
+          env:
+          - name: DATA_DIR
+            value: "/data"
+          volumeMounts:
+          - name: datadir-volume
+            mountPath: "/data"
+        volumes:
+        - name: datadir-volume
+          emptyDir: {}
