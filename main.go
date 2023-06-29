@@ -31,26 +31,25 @@ func main() {
 		log.Fatalf("Failed to process config: %v\n", err)
 	}
 
-	inDir := filepath.Join(Options.DataDir, "input")
+	// directory for fileserver and for isos to be created in
 	isosDir := filepath.Join(Options.DataDir, "isos")
-
-	files, err := os.ReadDir(inDir)
-	if err != nil {
-		log.Fatal(err)
+	if err := os.MkdirAll(isosDir, 0755); err != nil && !os.IsExist(err) {
+		log.WithError(err).Fatal("failed to create iso output dir")
 	}
 
-	for _, file := range files {
-		if !file.IsDir() {
-			fmt.Printf("skipping %s\n", file)
-			continue
-		}
-		dirName := file.Name()
-		isoPath := filepath.Join(isosDir, fmt.Sprintf("%s.iso", dirName))
-		if err := create(isoPath, filepath.Join(inDir, dirName), dirName); err != nil {
-			log.WithError(err).Fatalf("failed to create iso")
-		}
-		log.Infof("ISO created at %s", isoPath)
+	// create a single ISO to serve
+	isoPath := filepath.Join(isosDir, "test-config.iso")
+	isoWorkDir := filepath.Join(Options.DataDir, "input", "test-config")
+	if err := os.MkdirAll(isoWorkDir, 0755); err != nil && !os.IsExist(err) {
+		log.WithError(err).Fatal("failed to create iso work dir")
 	}
+	if err := createInputData(isoWorkDir); err != nil {
+		log.WithError(err).Fatal("failed to write input data")
+	}
+	if err := create(isoPath, isoWorkDir, "test-config"); err != nil {
+		log.WithError(err).Fatal("failed to create iso")
+	}
+	log.Infof("ISO created at %s", isoPath)
 
 	http.Handle("/", http.FileServer(http.Dir(isosDir)))
 	stop := make(chan os.Signal, 1)
@@ -65,11 +64,15 @@ func main() {
 	if err := server.Shutdown(context.TODO()); err != nil {
 		log.WithError(err).Errorf("shutdown failed: %v", err)
 		if err := server.Close(); err != nil {
-			log.WithError(err).Fatalf("emergency shutdown failed")
+			log.WithError(err).Fatal("emergency shutdown failed")
 		}
 	} else {
 		log.Infof("server terminated gracefully")
 	}
+}
+
+func createInputData(dir string) error {
+	return os.WriteFile(filepath.Join(dir, "config"), []byte("config-data"), 0644)
 }
 
 // create builds an iso file at outPath with the given volumeLabel using the contents of the working directory
