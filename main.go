@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
 	"github.com/kelseyhightower/envconfig"
 	log "github.com/sirupsen/logrus"
+	"github.com/stmcginnis/gofish"
+	"github.com/stmcginnis/gofish/redfish"
 )
 
 var Options struct {
@@ -22,6 +25,11 @@ var Options struct {
 	HTTPSKeyFile  string `envconfig:"HTTPS_KEY_FILE"`
 	HTTPSCertFile string `envconfig:"HTTPS_CERT_FILE"`
 	Port          string `envconfig:"PORT" default:"8080"`
+	BaseURL       string `envconfig:"BASE_URL"`
+
+	BMCAddress  string `envconfig:"BMC_ADDRESS"`
+	BMCPassword string `envconfig:"BMC_PASSWORD"`
+	BMCUser     string `envconfig:"BMC_USER"`
 }
 
 func main() {
@@ -60,6 +68,12 @@ func main() {
 	}
 	go initServer(server, Options.HTTPSKeyFile, Options.HTTPSCertFile)
 
+	if Options.BMCAddress != "" {
+		if err := configureBMC(Options.BMCAddress, Options.BMCUser, Options.BMCPassword, Options.BaseURL, "test-config.iso"); err != nil {
+			log.Error(err)
+		}
+	}
+
 	<-stop
 	if err := server.Shutdown(context.TODO()); err != nil {
 		log.WithError(err).Errorf("shutdown failed: %v", err)
@@ -69,6 +83,64 @@ func main() {
 	} else {
 		log.Infof("server terminated gracefully")
 	}
+}
+
+func configureBMC(address, user, pass, baseURL, file string) error {
+	// parse url and create full url to iso
+	_, err := url.JoinPath(baseURL, file)
+	if err != nil {
+		return err
+	}
+
+	u, err := url.Parse(address)
+	if err != nil {
+		return err
+	}
+
+	// connect to BMC
+	config := gofish.ClientConfig{
+		Endpoint:   fmt.Sprintf("%s://%s", u.Scheme, u.Host),
+		Username:   user,
+		Password:   pass,
+		BasicAuth:  true,
+		DumpWriter: log.StandardLogger().Writer(),
+	}
+	client, err := gofish.Connect(config)
+	if err != nil {
+		return fmt.Errorf("failed to connect using config %+v: %s", config, err)
+	}
+
+	system, err := redfish.GetComputerSystem(client, u.Path)
+	if err != nil {
+		return err
+	}
+
+	var isoVirtMedia *redfish.VirtualMedia
+	for _, m := range system.ManagedBy {
+		manager, err := redfish.GetManager(client, m)
+		if err != nil {
+			return err
+		}
+		vms, err := manager.VirtualMedia()
+		if err != nil {
+			return err
+		}
+		for _, vm := range vms {
+			for _, vmType := range vm.MediaTypes {
+				if vmType == redfish.CDMediaType {
+					isoVirtMedia = vm
+					break
+				}
+			}
+		}
+	}
+
+	if isoVirtMedia != nil {
+		log.Infof("found virt media for ISO: %+v", isoVirtMedia)
+	}
+
+	// add virtual media
+	return nil
 }
 
 func createInputData(dir string) error {

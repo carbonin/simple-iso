@@ -6,6 +6,7 @@ require (
 	github.com/diskfs/go-diskfs v1.3.0
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/sirupsen/logrus v1.7.0
+	github.com/stmcginnis/gofish v0.14.0
 )
 
 require (
