@@ -5,6 +5,9 @@ PORT := $(or ${PORT}, 8080)
 build:
 	podman build -f Dockerfile . -t $(IMAGE)
 
+push: build
+	podman push $(IMAGE)
+
 lint:
 	golangci-lint run -v
 
