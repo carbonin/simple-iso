@@ -15,17 +15,18 @@ import (
 	"github.com/diskfs/go-diskfs/filesystem"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
 	"github.com/kelseyhightower/envconfig"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/stmcginnis/gofish"
 	"github.com/stmcginnis/gofish/redfish"
 )
 
 var Options struct {
 	DataDir       string `envconfig:"DATA_DIR"`
-	HTTPSKeyFile  string `envconfig:"HTTPS_KEY_FILE"`
-	HTTPSCertFile string `envconfig:"HTTPS_CERT_FILE"`
+	LogLevel      string `envconfig:"LOG_LEVEL" default:"info"`
 	Port          string `envconfig:"PORT" default:"8080"`
 	BaseURL       string `envconfig:"BASE_URL"`
+	HTTPSKeyFile  string `envconfig:"HTTPS_KEY_FILE"`
+	HTTPSCertFile string `envconfig:"HTTPS_CERT_FILE"`
 
 	BMCAddress  string `envconfig:"BMC_ADDRESS"`
 	BMCPassword string `envconfig:"BMC_PASSWORD"`
@@ -33,11 +34,18 @@ var Options struct {
 }
 
 func main() {
+	log := logrus.New()
 	log.SetReportCaller(true)
 	err := envconfig.Process("fileserver", &Options)
 	if err != nil {
 		log.Fatalf("Failed to process config: %v\n", err)
 	}
+
+	level, err := logrus.ParseLevel(Options.LogLevel)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.SetLevel(level)
 
 	// directory for fileserver and for isos to be created in
 	isosDir := filepath.Join(Options.DataDir, "isos")
@@ -66,11 +74,13 @@ func main() {
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%s", Options.Port),
 	}
-	go initServer(server, Options.HTTPSKeyFile, Options.HTTPSCertFile)
+	go initServer(log, server, Options.HTTPSKeyFile, Options.HTTPSCertFile)
 
 	if Options.BMCAddress != "" {
-		if err := configureBMC(Options.BMCAddress, Options.BMCUser, Options.BMCPassword, Options.BaseURL, "test-config.iso"); err != nil {
+		if err := configureBMC(log, Options.BMCAddress, Options.BMCUser, Options.BMCPassword, Options.BaseURL, "test-config.iso"); err != nil {
 			log.Error(err)
+		} else {
+			log.Infof("BMC configured to use new ISO for virtual media")
 		}
 	}
 
@@ -85,13 +95,7 @@ func main() {
 	}
 }
 
-func configureBMC(address, user, pass, baseURL, file string) error {
-	// parse url and create full url to iso
-	_, err := url.JoinPath(baseURL, file)
-	if err != nil {
-		return err
-	}
-
+func configureBMC(log *logrus.Logger, address, user, pass, baseURL, file string) error {
 	u, err := url.Parse(address)
 	if err != nil {
 		return err
@@ -103,11 +107,11 @@ func configureBMC(address, user, pass, baseURL, file string) error {
 		Username:   user,
 		Password:   pass,
 		BasicAuth:  true,
-		DumpWriter: log.StandardLogger().Writer(),
+		DumpWriter: log.WriterLevel(logrus.DebugLevel),
 	}
 	client, err := gofish.Connect(config)
 	if err != nil {
-		return fmt.Errorf("failed to connect using config %+v: %s", config, err)
+		return err
 	}
 
 	system, err := redfish.GetComputerSystem(client, u.Path)
@@ -135,12 +139,26 @@ func configureBMC(address, user, pass, baseURL, file string) error {
 		}
 	}
 
-	if isoVirtMedia != nil {
-		log.Infof("found virt media for ISO: %+v", isoVirtMedia)
+	if isoVirtMedia == nil {
+		return fmt.Errorf("failed to find CD type virtual media")
 	}
 
+	// parse url and create full url to iso
+	isoURL, err := url.JoinPath(baseURL, file)
+	if err != nil {
+		return err
+	}
+	log.Infof("got ISO URL: %s", isoURL)
+
 	// add virtual media
-	return nil
+	if isoVirtMedia.Inserted {
+		if err := isoVirtMedia.EjectMedia(); err != nil {
+			log.Error("failed to eject media")
+			return err
+		}
+	}
+
+	return isoVirtMedia.InsertMedia(isoURL, true, true)
 }
 
 func createInputData(dir string) error {
@@ -185,7 +203,7 @@ func create(outPath string, workDir string, volumeLabel string) error {
 	return iso.Finalize(options)
 }
 
-func initServer(server *http.Server, httpsKeyFile, httpsCertFile string) {
+func initServer(log *logrus.Logger, server *http.Server, httpsKeyFile, httpsCertFile string) {
 	var err error
 	if httpsKeyFile != "" && httpsCertFile != "" {
 		log.Infof("Starting https handler on %s...", server.Addr)
