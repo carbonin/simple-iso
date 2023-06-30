@@ -17,6 +17,8 @@ metadata:
 objects:
 - apiVersion: route.openshift.io/v1
   kind: Route
+  metadata:
+    name: config-image-server
   spec:
     to:
       kind: Service
