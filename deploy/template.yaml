@@ -59,7 +59,7 @@ objects:
           - name: BMC_ADDRESS
             value: ${BMC_ADDRESS}
           - name: BMC_PASSWORD
-            value: ${BMH_PASSWORD}
+            value: ${BMC_PASSWORD}
           - name: BMC_USER
             value: ${BMC_USER}
           - name: DATA_DIR
