@@ -33,6 +33,8 @@ var Options struct {
 	BMCUser     string `envconfig:"BMC_USER"`
 }
 
+const testISOName = "test-config.iso"
+
 func main() {
 	log := logrus.New()
 	log.SetReportCaller(true)
@@ -53,118 +55,48 @@ func main() {
 		log.WithError(err).Fatal("failed to create iso output dir")
 	}
 
-	// create a single ISO to serve
-	isoPath := filepath.Join(isosDir, "test-config.iso")
-	isoWorkDir := filepath.Join(Options.DataDir, "input", "test-config")
-	if err := os.MkdirAll(isoWorkDir, 0755); err != nil && !os.IsExist(err) {
-		log.WithError(err).Fatal("failed to create iso work dir")
+	if err := createTestISO(log, Options.DataDir, filepath.Join(isosDir, testISOName)); err != nil {
+		log.Fatal(err)
 	}
-	if err := createInputData(isoWorkDir); err != nil {
-		log.WithError(err).Fatal("failed to write input data")
-	}
-	if err := create(isoPath, isoWorkDir, "test-config"); err != nil {
-		log.WithError(err).Fatal("failed to create iso")
-	}
-	log.Infof("ISO created at %s", isoPath)
 
-	http.Handle("/", http.FileServer(http.Dir(isosDir)))
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-
-	server := &http.Server{
-		Addr: fmt.Sprintf(":%s", Options.Port),
-	}
-	go initServer(log, server, Options.HTTPSKeyFile, Options.HTTPSCertFile)
+	server := startFileServer(log, isosDir, Options.Port, Options.HTTPSKeyFile, Options.HTTPSCertFile)
 
 	if Options.BMCAddress != "" {
-		if err := configureBMC(log, Options.BMCAddress, Options.BMCUser, Options.BMCPassword, Options.BaseURL, "test-config.iso"); err != nil {
+		// parse url and create full url to iso
+		isoURL, err := url.JoinPath(Options.BaseURL, testISOName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Infof("got ISO URL: %s", isoURL)
+		if err := configureBMC(log, Options.BMCAddress, Options.BMCUser, Options.BMCPassword, isoURL); err != nil {
 			log.Error(err)
 		} else {
 			log.Infof("BMC configured to use new ISO for virtual media and powered on")
 		}
 	}
 
-	<-stop
-	if err := server.Shutdown(context.TODO()); err != nil {
-		log.WithError(err).Errorf("shutdown failed: %v", err)
-		if err := server.Close(); err != nil {
-			log.WithError(err).Fatal("emergency shutdown failed")
-		}
-	} else {
-		log.Infof("server terminated gracefully")
-	}
+	waitForShutDown(log, server)
 }
 
-func configureBMC(log *logrus.Logger, address, user, pass, baseURL, file string) error {
-	u, err := url.Parse(address)
+// createTestISO creates a single ISO containing a single file at isoPath
+// the temp dir is cleaned up by the ISO creation process
+func createTestISO(log *logrus.Logger, dataDir, isoPath string) error {
+	isoWorkDir, err := os.MkdirTemp(dataDir, "test-config")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create iso work dir: %w", err)
 	}
-
-	// connect to BMC
-	config := gofish.ClientConfig{
-		Endpoint:   fmt.Sprintf("%s://%s", u.Scheme, u.Host),
-		Username:   user,
-		Password:   pass,
-		BasicAuth:  true,
-		DumpWriter: log.WriterLevel(logrus.DebugLevel),
+	if err := createInputData(isoWorkDir); err != nil {
+		return fmt.Errorf("failed to write input data: %w", err)
 	}
-	client, err := gofish.Connect(config)
-	if err != nil {
-		return err
+	if err := create(isoPath, isoWorkDir, "test-config"); err != nil {
+		return fmt.Errorf("failed to create iso: %w", err)
 	}
-
-	system, err := redfish.GetComputerSystem(client, u.Path)
-	if err != nil {
-		return err
-	}
-
-	var isoVirtMedia *redfish.VirtualMedia
-	for _, m := range system.ManagedBy {
-		manager, err := redfish.GetManager(client, m)
-		if err != nil {
-			return err
-		}
-		vms, err := manager.VirtualMedia()
-		if err != nil {
-			return err
-		}
-		for _, vm := range vms {
-			for _, vmType := range vm.MediaTypes {
-				if vmType == redfish.CDMediaType {
-					isoVirtMedia = vm
-					break
-				}
-			}
-		}
-	}
-
-	if isoVirtMedia == nil {
-		return fmt.Errorf("failed to find CD type virtual media")
-	}
-
-	// parse url and create full url to iso
-	isoURL, err := url.JoinPath(baseURL, file)
-	if err != nil {
-		return err
-	}
-	log.Infof("got ISO URL: %s", isoURL)
-
-	// add virtual media
-	if isoVirtMedia.Inserted {
-		if err := isoVirtMedia.EjectMedia(); err != nil {
-			log.Error("failed to eject media")
-			return err
-		}
-	}
-
-	if err := isoVirtMedia.InsertMedia(isoURL, true, true); err != nil {
-		return err
-	}
-
-	return system.Reset(redfish.OnResetType)
+	log.Infof("Test iso created at %s", isoPath)
+	return nil
 }
 
+// createInputData writes a test file in dir to be packaged into an iso
+// in the future more meaningful data should be included here
 func createInputData(dir string) error {
 	return os.WriteFile(filepath.Join(dir, "config"), []byte("config-data"), 0644)
 }
@@ -207,17 +139,104 @@ func create(outPath string, workDir string, volumeLabel string) error {
 	return iso.Finalize(options)
 }
 
-func initServer(log *logrus.Logger, server *http.Server, httpsKeyFile, httpsCertFile string) {
-	var err error
-	if httpsKeyFile != "" && httpsCertFile != "" {
-		log.Infof("Starting https handler on %s...", server.Addr)
-		err = server.ListenAndServeTLS(httpsCertFile, httpsKeyFile)
-	} else {
-		log.Infof("Starting http handler on %s...", server.Addr)
-		err = server.ListenAndServe()
+func configureBMC(log *logrus.Logger, address, user, pass, isoURL string) error {
+	u, err := url.Parse(address)
+	if err != nil {
+		return err
 	}
 
-	if err != http.ErrServerClosed {
-		log.WithError(err).Fatalf("HTTP listener closed: %v", err)
+	// connect to BMC
+	config := gofish.ClientConfig{
+		Endpoint:   fmt.Sprintf("%s://%s", u.Scheme, u.Host),
+		Username:   user,
+		Password:   pass,
+		BasicAuth:  true,
+		DumpWriter: log.WriterLevel(logrus.DebugLevel),
+	}
+	client, err := gofish.Connect(config)
+	if err != nil {
+		return err
+	}
+
+	system, err := redfish.GetComputerSystem(client, u.Path)
+	if err != nil {
+		return err
+	}
+
+	// find CD virtual media
+	var isoVirtMedia *redfish.VirtualMedia
+	for _, m := range system.ManagedBy {
+		manager, err := redfish.GetManager(client, m)
+		if err != nil {
+			return err
+		}
+		vms, err := manager.VirtualMedia()
+		if err != nil {
+			return err
+		}
+		for _, vm := range vms {
+			for _, vmType := range vm.MediaTypes {
+				if vmType == redfish.CDMediaType {
+					isoVirtMedia = vm
+					break
+				}
+			}
+		}
+	}
+	if isoVirtMedia == nil {
+		return fmt.Errorf("failed to find CD type virtual media")
+	}
+
+	// add ISO to virtual media
+	if isoVirtMedia.Inserted {
+		if err := isoVirtMedia.EjectMedia(); err != nil {
+			log.Error("failed to eject media")
+			return err
+		}
+	}
+	if err := isoVirtMedia.InsertMedia(isoURL, true, true); err != nil {
+		return err
+	}
+
+	// boot
+	return system.Reset(redfish.OnResetType)
+}
+
+func startFileServer(log *logrus.Logger, isosDir, port, httpsKeyFile, httpsCertFile string) *http.Server {
+	http.Handle("/", http.FileServer(http.Dir(isosDir)))
+	server := &http.Server{
+		Addr: fmt.Sprintf(":%s", port),
+	}
+
+	go func() {
+		var err error
+		if httpsKeyFile != "" && httpsCertFile != "" {
+			log.Infof("Starting https handler on %s...", server.Addr)
+			err = server.ListenAndServeTLS(httpsCertFile, httpsKeyFile)
+		} else {
+			log.Infof("Starting http handler on %s...", server.Addr)
+			err = server.ListenAndServe()
+		}
+
+		if err != http.ErrServerClosed {
+			log.WithError(err).Fatalf("HTTP listener closed: %v", err)
+		}
+	}()
+
+	return server
+}
+
+func waitForShutDown(log *logrus.Logger, server *http.Server) {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	if err := server.Shutdown(context.Background()); err != nil {
+		log.WithError(err).Errorf("shutdown failed")
+		if err := server.Close(); err != nil {
+			log.WithError(err).Fatal("emergency shutdown failed")
+		}
+	} else {
+		log.Infof("server terminated gracefully")
 	}
 }
