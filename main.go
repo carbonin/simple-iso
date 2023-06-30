@@ -80,7 +80,7 @@ func main() {
 		if err := configureBMC(log, Options.BMCAddress, Options.BMCUser, Options.BMCPassword, Options.BaseURL, "test-config.iso"); err != nil {
 			log.Error(err)
 		} else {
-			log.Infof("BMC configured to use new ISO for virtual media")
+			log.Infof("BMC configured to use new ISO for virtual media and powered on")
 		}
 	}
 
@@ -158,7 +158,11 @@ func configureBMC(log *logrus.Logger, address, user, pass, baseURL, file string)
 		}
 	}
 
-	return isoVirtMedia.InsertMedia(isoURL, true, true)
+	if err := isoVirtMedia.InsertMedia(isoURL, true, true); err != nil {
+		return err
+	}
+
+	return system.Reset(redfish.OnResetType)
 }
 
 func createInputData(dir string) error {
