@@ -4,11 +4,25 @@ parameters:
   value: quay.io/carbonin/config-image-server
 - name: TAG
   value: latest
+- name: BMC_ADDRESS
+  required: true
+- name: BMC_USER
+  value: admin
+- name: BMC_PASSWORD
+  value: password
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
   name: assisted-installer
 objects:
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  spec:
+    to:
+      kind: Service
+      name: config-image-server
+    port:
+      targetPort: config-server
 - apiVersion: v1
   kind: Service
   metadata:
@@ -38,16 +52,15 @@ objects:
         containers:
         - name: config-image-server
           image: ${IMAGE}:${TAG}
-          imagePullPolicy: Always
           ports:
           - name: config-server
             containerPort: 8080
           env:
+          - name: BMC_ADDRESS
+            value: ${BMC_ADDRESS}
+          - name: BMC_PASSWORD
+            value: ${BMH_PASSWORD}
+          - name: BMC_USER
+            value: ${BMC_USER}
           - name: DATA_DIR
             value: "/data"
-          volumeMounts:
-          - name: datadir-volume
-            mountPath: "/data"
-        volumes:
-        - name: datadir-volume
-          emptyDir: {}
