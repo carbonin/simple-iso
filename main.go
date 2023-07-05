@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/diskfs/go-diskfs"
 	"github.com/diskfs/go-diskfs/disk"
@@ -58,20 +59,18 @@ func main() {
 	if err := createTestISO(log, Options.DataDir, filepath.Join(isosDir, testISOName)); err != nil {
 		log.Fatal(err)
 	}
+	// parse url and create full url to iso
+	isoURL, err := url.JoinPath(Options.BaseURL, "images", testISOName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Infof("got ISO URL: %s", isoURL)
 
-	server := startFileServer(log, isosDir, Options.Port, Options.HTTPSKeyFile, Options.HTTPSCertFile)
+	server := startHTTPServer(log, isosDir, Options.Port, Options.HTTPSKeyFile, Options.HTTPSCertFile)
 
 	if Options.BMCAddress != "" {
-		// parse url and create full url to iso
-		isoURL, err := url.JoinPath(Options.BaseURL, testISOName)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Infof("got ISO URL: %s", isoURL)
-		if err := configureBMC(log, Options.BMCAddress, Options.BMCUser, Options.BMCPassword, isoURL); err != nil {
-			log.Error(err)
-		} else {
-			log.Infof("BMC configured to use new ISO for virtual media and powered on")
+		if err := testVirtualMedia(log, isoURL); err != nil {
+			log.WithError(err).Errorf("failed to test virtual media")
 		}
 	}
 
@@ -139,32 +138,31 @@ func create(outPath string, workDir string, volumeLabel string) error {
 	return iso.Finalize(options)
 }
 
-func configureBMC(log *logrus.Logger, address, user, pass, isoURL string) error {
-	u, err := url.Parse(address)
+// testVirtualMedia connects to the BMC using the fields of Options and inserts and removes the test ISO
+func testVirtualMedia(log *logrus.Logger, isoURL string) error {
+	bmcURL, err := url.Parse(Options.BMCAddress)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to parse BMC Address %s: %w", Options.BMCAddress, err)
 	}
 
-	// connect to BMC
 	config := gofish.ClientConfig{
-		Endpoint:   fmt.Sprintf("%s://%s", u.Scheme, u.Host),
-		Username:   user,
-		Password:   pass,
+		Endpoint:   fmt.Sprintf("%s://%s", bmcURL.Scheme, bmcURL.Host),
+		Username:   Options.BMCUser,
+		Password:   Options.BMCPassword,
 		BasicAuth:  true,
 		DumpWriter: log.WriterLevel(logrus.DebugLevel),
 	}
 	client, err := gofish.Connect(config)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to BMC: %w", err)
 	}
 
-	system, err := redfish.GetComputerSystem(client, u.Path)
+	system, err := redfish.GetComputerSystem(client, bmcURL.Path)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get computer system: %w", err)
 	}
 
-	// find CD virtual media
-	var isoVirtMedia *redfish.VirtualMedia
+	var isoVM *redfish.VirtualMedia
 	for _, m := range system.ManagedBy {
 		manager, err := redfish.GetManager(client, m)
 		if err != nil {
@@ -177,33 +175,45 @@ func configureBMC(log *logrus.Logger, address, user, pass, isoURL string) error 
 		for _, vm := range vms {
 			for _, vmType := range vm.MediaTypes {
 				if vmType == redfish.CDMediaType {
-					isoVirtMedia = vm
+					isoVM = vm
 					break
 				}
 			}
 		}
 	}
-	if isoVirtMedia == nil {
+
+	if isoVM == nil {
 		return fmt.Errorf("failed to find CD type virtual media")
 	}
 
-	// add ISO to virtual media
-	if isoVirtMedia.Inserted {
-		if err := isoVirtMedia.EjectMedia(); err != nil {
-			log.Error("failed to eject media")
-			return err
+	if isoVM.Inserted {
+		if err := isoVM.EjectMedia(); err != nil {
+			return fmt.Errorf("failed to eject media: %w", err)
 		}
 	}
-	if err := isoVirtMedia.InsertMedia(isoURL, true, true); err != nil {
-		return err
+	if err := isoVM.InsertMedia(isoURL, true, true); err != nil {
+		return fmt.Errorf("failed to insert media: %w", err)
 	}
 
-	// boot
-	return system.Reset(redfish.OnResetType)
+	log.Info("media inserted, booting host")
+
+	if err := system.Reset(redfish.OnResetType); err != nil {
+		return fmt.Errorf("failed to boot system: %w", err)
+	}
+
+	log.Info("waiting 5 minutes")
+	time.Sleep(5 * time.Minute)
+
+	if err := isoVM.EjectMedia(); err != nil {
+		return fmt.Errorf("failed to eject media: %w", err)
+	}
+	log.Info("media ejected")
+
+	return nil
 }
 
-func startFileServer(log *logrus.Logger, isosDir, port, httpsKeyFile, httpsCertFile string) *http.Server {
-	http.Handle("/", http.FileServer(http.Dir(isosDir)))
+func startHTTPServer(log *logrus.Logger, isosDir, port, httpsKeyFile, httpsCertFile string) *http.Server {
+	http.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir(isosDir))))
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%s", port),
 	}
